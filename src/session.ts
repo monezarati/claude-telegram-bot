@@ -1,19 +1,16 @@
 /**
  * Session management for Claude Telegram Bot.
  *
- * ClaudeSession class manages Claude Code sessions using the Agent SDK V1.
- * V1 supports full options (cwd, mcpServers, settingSources, etc.)
+ * Delegates LLM calls to a pluggable provider (Claude Agent SDK, Groq, etc.).
+ * Session persistence, safety checks, and streaming callbacks live here.
  */
 
-import {
-  query,
-  type Options,
-  type SDKMessage,
-} from "@anthropic-ai/claude-agent-sdk";
 import { readFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
+  LLM_MODEL,
+  LLM_PROVIDER,
   MCP_SERVERS,
   SAFETY_PROMPT,
   SESSION_FILE,
@@ -25,6 +22,7 @@ import {
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
+import { createProvider, type LLMProvider } from "./providers";
 import { checkCommandSafety, isPathAllowed } from "./security";
 import type {
   SavedSession,
@@ -54,22 +52,7 @@ function getThinkingLevel(message: string): number {
 }
 
 /**
- * Extract text content from SDK message.
- */
-function getTextFromMessage(msg: SDKMessage): string | null {
-  if (msg.type !== "assistant") return null;
-
-  const textParts: string[] = [];
-  for (const block of msg.message.content) {
-    if (block.type === "text") {
-      textParts.push(block.text);
-    }
-  }
-  return textParts.length > 0 ? textParts.join("") : null;
-}
-
-/**
- * Manages Claude Code sessions using the Agent SDK V1.
+ * Manages bot sessions, delegating LLM calls to a provider.
  */
 // Maximum number of sessions to keep in history
 const MAX_SESSIONS = 5;
@@ -86,14 +69,29 @@ class ClaudeSession {
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
 
+  readonly provider: LLMProvider;
+
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
   private stopRequested = false;
   private _isProcessing = false;
   private _wasInterruptedByNewMessage = false;
+  // Track whether Groq has an active conversation (for isActive)
+  private _groqConversationStarted = false;
+
+  constructor() {
+    this.provider = createProvider(LLM_PROVIDER);
+    console.log(
+      `LLM provider initialized: ${this.provider.name} (tools=${this.provider.supportsTools}, resume=${this.provider.supportsResume})`
+    );
+  }
 
   get isActive(): boolean {
-    return this.sessionId !== null;
+    if (this.provider.supportsResume) {
+      return this.sessionId !== null;
+    }
+    // For providers without session resume, track conversation state
+    return this._groqConversationStarted;
   }
 
   get isRunning(): boolean {
@@ -163,7 +161,7 @@ class ClaudeSession {
   }
 
   /**
-   * Send a message to Claude with streaming updates via callback.
+   * Send a message with streaming updates via callback.
    *
    * @param ctx - grammY context for ask_user button display
    */
@@ -181,12 +179,14 @@ class ClaudeSession {
     }
 
     const isNewSession = !this.isActive;
-    const thinkingTokens = getThinkingLevel(message);
+    const thinkingTokens = this.provider.supportsTools
+      ? getThinkingLevel(message)
+      : 0;
     const thinkingLabel =
       { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] ||
       String(thinkingTokens);
 
-    // Inject current date/time at session start so Claude doesn't need to call a tool for it
+    // Inject current date/time at session start so the LLM doesn't need to call a tool for it
     let messageToSend = message;
     if (isNewSession) {
       const now = new Date();
@@ -205,34 +205,17 @@ class ClaudeSession {
       messageToSend = datePrefix + message;
     }
 
-    // Build SDK V1 options - supports all features
-    const options: Options = {
-      model: "claude-sonnet-4-5",
-      cwd: WORKING_DIR,
-      settingSources: ["user", "project"],
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      systemPrompt: SAFETY_PROMPT,
-      mcpServers: MCP_SERVERS,
-      maxThinkingTokens: thinkingTokens,
-      additionalDirectories: ALLOWED_PATHS,
-      resume: this.sessionId || undefined,
-    };
-
-    // Add Claude Code executable path if set (required for standalone builds)
-    if (process.env.CLAUDE_CODE_PATH) {
-      options.pathToClaudeCodeExecutable = process.env.CLAUDE_CODE_PATH;
-    }
-
-    if (this.sessionId && !isNewSession) {
+    if (this.sessionId && !isNewSession && this.provider.supportsResume) {
       console.log(
         `RESUMING session ${this.sessionId.slice(
           0,
           8
         )}... (thinking=${thinkingLabel})`
       );
-    } else {
-      console.log(`STARTING new Claude session (thinking=${thinkingLabel})`);
+    } else if (isNewSession) {
+      console.log(
+        `STARTING new ${this.provider.name} session (thinking=${thinkingLabel})`
+      );
       this.sessionId = null;
     }
 
@@ -261,147 +244,145 @@ class ClaudeSession {
     let askUserTriggered = false;
 
     try {
-      // Use V1 query() API - supports all options including cwd, mcpServers, etc.
-      const queryInstance = query({
-        prompt: messageToSend,
-        options: {
-          ...options,
-          abortController: this.abortController,
-        },
+      const eventStream = this.provider.sendMessage(messageToSend, {
+        systemPrompt: SAFETY_PROMPT,
+        model: LLM_MODEL,
+        cwd: WORKING_DIR,
+        thinkingTokens,
+        abortSignal: this.abortController.signal,
+        sessionId: this.sessionId || undefined,
+        mcpServers: MCP_SERVERS,
+        allowedPaths: ALLOWED_PATHS,
       });
 
-      // Process streaming response
-      for await (const event of queryInstance) {
+      // Mark conversation as started for non-resumable providers
+      if (!this.provider.supportsResume) {
+        this._groqConversationStarted = true;
+      }
+
+      for await (const event of eventStream) {
         // Check for abort
         if (this.stopRequested) {
           console.log("Query aborted by user");
           break;
         }
 
-        // Capture session_id from first message
-        if (!this.sessionId && event.session_id) {
-          this.sessionId = event.session_id;
+        // Capture session_id
+        if (event.type === "session_id") {
+          this.sessionId = event.id;
           console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
           this.saveSession();
         }
 
-        // Handle different message types
-        if (event.type === "assistant") {
-          for (const block of event.message.content) {
-            // Thinking blocks
-            if (block.type === "thinking") {
-              const thinkingText = block.thinking;
-              if (thinkingText) {
-                console.log(`THINKING BLOCK: ${thinkingText.slice(0, 100)}...`);
-                await statusCallback("thinking", thinkingText);
-              }
+        // Thinking blocks
+        if (event.type === "thinking") {
+          console.log(`THINKING BLOCK: ${event.text.slice(0, 100)}...`);
+          await statusCallback("thinking", event.text);
+        }
+
+        // Tool use blocks (only from providers that support tools)
+        if (event.type === "tool_use") {
+          const toolName = event.name;
+          const toolInput = event.input;
+
+          // Safety check for Bash commands
+          if (toolName === "Bash") {
+            const command = String(toolInput.command || "");
+            const [isSafe, reason] = checkCommandSafety(command);
+            if (!isSafe) {
+              console.warn(`BLOCKED: ${reason}`);
+              await statusCallback("tool", `BLOCKED: ${reason}`);
+              throw new Error(`Unsafe command blocked: ${reason}`);
             }
+          }
 
-            // Tool use blocks
-            if (block.type === "tool_use") {
-              const toolName = block.name;
-              const toolInput = block.input as Record<string, unknown>;
+          // Safety check for file operations
+          if (["Read", "Write", "Edit"].includes(toolName)) {
+            const filePath = String(toolInput.file_path || "");
+            if (filePath) {
+              // Allow reads from temp paths and .claude directories
+              const isTmpRead =
+                toolName === "Read" &&
+                (TEMP_PATHS.some((p) => filePath.startsWith(p)) ||
+                  filePath.includes("/.claude/"));
 
-              // Safety check for Bash commands
-              if (toolName === "Bash") {
-                const command = String(toolInput.command || "");
-                const [isSafe, reason] = checkCommandSafety(command);
-                if (!isSafe) {
-                  console.warn(`BLOCKED: ${reason}`);
-                  await statusCallback("tool", `BLOCKED: ${reason}`);
-                  throw new Error(`Unsafe command blocked: ${reason}`);
-                }
-              }
-
-              // Safety check for file operations
-              if (["Read", "Write", "Edit"].includes(toolName)) {
-                const filePath = String(toolInput.file_path || "");
-                if (filePath) {
-                  // Allow reads from temp paths and .claude directories
-                  const isTmpRead =
-                    toolName === "Read" &&
-                    (TEMP_PATHS.some((p) => filePath.startsWith(p)) ||
-                      filePath.includes("/.claude/"));
-
-                  if (!isTmpRead && !isPathAllowed(filePath)) {
-                    console.warn(
-                      `BLOCKED: File access outside allowed paths: ${filePath}`
-                    );
-                    await statusCallback("tool", `Access denied: ${filePath}`);
-                    throw new Error(`File access blocked: ${filePath}`);
-                  }
-                }
-              }
-
-              // Segment ends when tool starts
-              if (currentSegmentText) {
-                await statusCallback(
-                  "segment_end",
-                  currentSegmentText,
-                  currentSegmentId
+              if (!isTmpRead && !isPathAllowed(filePath)) {
+                console.warn(
+                  `BLOCKED: File access outside allowed paths: ${filePath}`
                 );
-                currentSegmentId++;
-                currentSegmentText = "";
-              }
-
-              // Format and show tool status
-              const toolDisplay = formatToolStatus(toolName, toolInput);
-              this.currentTool = toolDisplay;
-              this.lastTool = toolDisplay;
-              console.log(`Tool: ${toolDisplay}`);
-
-              // Don't show tool status for ask_user - the buttons are self-explanatory
-              if (!toolName.startsWith("mcp__ask-user")) {
-                await statusCallback("tool", toolDisplay);
-              }
-
-              // Check for pending ask_user requests after ask-user MCP tool
-              if (toolName.startsWith("mcp__ask-user") && ctx && chatId) {
-                // Small delay to let MCP server write the file
-                await new Promise((resolve) => setTimeout(resolve, 200));
-
-                // Retry a few times in case of timing issues
-                for (let attempt = 0; attempt < 3; attempt++) {
-                  const buttonsSent = await checkPendingAskUserRequests(
-                    ctx,
-                    chatId
-                  );
-                  if (buttonsSent) {
-                    askUserTriggered = true;
-                    break;
-                  }
-                  if (attempt < 2) {
-                    await new Promise((resolve) => setTimeout(resolve, 100));
-                  }
-                }
-              }
-            }
-
-            // Text content
-            if (block.type === "text") {
-              responseParts.push(block.text);
-              currentSegmentText += block.text;
-
-              // Stream text updates (throttled)
-              const now = Date.now();
-              if (
-                now - lastTextUpdate > STREAMING_THROTTLE_MS &&
-                currentSegmentText.length > 20
-              ) {
-                await statusCallback(
-                  "text",
-                  currentSegmentText,
-                  currentSegmentId
-                );
-                lastTextUpdate = now;
+                await statusCallback("tool", `Access denied: ${filePath}`);
+                throw new Error(`File access blocked: ${filePath}`);
               }
             }
           }
 
-          // Break out of event loop if ask_user was triggered
-          if (askUserTriggered) {
-            break;
+          // Segment ends when tool starts
+          if (currentSegmentText) {
+            await statusCallback(
+              "segment_end",
+              currentSegmentText,
+              currentSegmentId
+            );
+            currentSegmentId++;
+            currentSegmentText = "";
           }
+
+          // Format and show tool status
+          const toolDisplay = formatToolStatus(toolName, toolInput);
+          this.currentTool = toolDisplay;
+          this.lastTool = toolDisplay;
+          console.log(`Tool: ${toolDisplay}`);
+
+          // Don't show tool status for ask_user - the buttons are self-explanatory
+          if (!toolName.startsWith("mcp__ask-user")) {
+            await statusCallback("tool", toolDisplay);
+          }
+
+          // Check for pending ask_user requests after ask-user MCP tool
+          if (toolName.startsWith("mcp__ask-user") && ctx && chatId) {
+            // Small delay to let MCP server write the file
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            // Retry a few times in case of timing issues
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const buttonsSent = await checkPendingAskUserRequests(
+                ctx,
+                chatId
+              );
+              if (buttonsSent) {
+                askUserTriggered = true;
+                break;
+              }
+              if (attempt < 2) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+            }
+          }
+        }
+
+        // Text content
+        if (event.type === "text") {
+          responseParts.push(event.text);
+          currentSegmentText += event.text;
+
+          // Stream text updates (throttled)
+          const now = Date.now();
+          if (
+            now - lastTextUpdate > STREAMING_THROTTLE_MS &&
+            currentSegmentText.length > 20
+          ) {
+            await statusCallback(
+              "text",
+              currentSegmentText,
+              currentSegmentId
+            );
+            lastTextUpdate = now;
+          }
+        }
+
+        // Break out of event loop if ask_user was triggered
+        if (askUserTriggered) {
+          break;
         }
 
         // Result message
@@ -410,7 +391,7 @@ class ClaudeSession {
           queryCompleted = true;
 
           // Capture usage if available
-          if ("usage" in event && event.usage) {
+          if (event.usage) {
             this.lastUsage = event.usage as TokenUsage;
             const u = this.lastUsage;
             console.log(
@@ -421,8 +402,6 @@ class ClaudeSession {
           }
         }
       }
-
-      // V1 query completes automatically when the generator ends
     } catch (error) {
       const errorStr = String(error).toLowerCase();
       const isCleanupError =
@@ -463,25 +442,27 @@ class ClaudeSession {
 
     await statusCallback("done", "");
 
-    return responseParts.join("") || "No response from Claude.";
+    return responseParts.join("") || "No response.";
   }
 
   /**
-   * Kill the current session (clear session_id).
+   * Kill the current session (clear session_id and provider state).
    */
   async kill(): Promise<void> {
     this.sessionId = null;
     this.lastActivity = null;
     this.conversationTitle = null;
+    this._groqConversationStarted = false;
+    this.provider.reset();
     console.log("Session cleared");
   }
 
   /**
    * Save session to disk for resume after restart.
-   * Saves to multi-session history format.
+   * Only works for providers that support session resume.
    */
   saveSession(): void {
-    if (!this.sessionId) return;
+    if (!this.sessionId || !this.provider.supportsResume) return;
 
     try {
       // Load existing session history
@@ -549,6 +530,10 @@ class ClaudeSession {
    * Resume a specific session by ID.
    */
   resumeSession(sessionId: string): [success: boolean, message: string] {
+    if (!this.provider.supportsResume) {
+      return [false, `${this.provider.name} provider does not support session resume`];
+    }
+
     const history = this.loadSessionHistory();
     const sessionData = history.sessions.find((s) => s.session_id === sessionId);
 
@@ -581,6 +566,10 @@ class ClaudeSession {
    * Resume the last persisted session (legacy method, now resumes most recent).
    */
   resumeLast(): [success: boolean, message: string] {
+    if (!this.provider.supportsResume) {
+      return [false, `${this.provider.name} provider does not support session resume`];
+    }
+
     const sessions = this.getSessionList();
     if (sessions.length === 0) {
       return [false, "Nessuna sessione salvata"];

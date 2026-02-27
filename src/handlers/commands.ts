@@ -6,7 +6,7 @@
 
 import type { Context } from "grammy";
 import { session } from "../session";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "../config";
+import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, LLM_PROVIDER, LLM_MODEL } from "../config";
 import { isAuthorized } from "../security";
 
 /**
@@ -158,6 +158,11 @@ export async function handleStatus(ctx: Context): Promise<void> {
       : "?";
     lines.push(`\n⚠️ Last error (${ago}s ago):`, `   ${session.lastError}`);
   }
+
+  // Provider info
+  const toolsNote = session.provider.supportsTools ? "tools enabled" : "chat only";
+  lines.push(`\n🤖 Provider: <code>${LLM_PROVIDER}</code> (${toolsNote})`);
+  lines.push(`   Model: <code>${LLM_MODEL}</code>`);
 
   // Working directory
   lines.push(`\n📁 Working dir: <code>${WORKING_DIR}</code>`);

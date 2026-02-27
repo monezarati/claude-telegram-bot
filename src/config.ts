@@ -45,6 +45,21 @@ export const ALLOWED_USERS: number[] = (
 export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
+// ============== LLM Provider Configuration ==============
+
+export const LLM_PROVIDER = (
+  process.env.LLM_PROVIDER || "claude"
+).toLowerCase();
+export const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+
+const DEFAULT_MODELS: Record<string, string> = {
+  claude: "claude-sonnet-4-5",
+  groq: "llama-3.3-70b-versatile",
+};
+
+export const LLM_MODEL =
+  process.env.LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER] || "claude-sonnet-4-5";
+
 // ============== Claude CLI Path ==============
 
 // Auto-detect from PATH, or use environment override
@@ -243,6 +258,13 @@ if (ALLOWED_USERS.length === 0) {
   process.exit(1);
 }
 
+if (LLM_PROVIDER === "groq" && !GROQ_API_KEY) {
+  console.error(
+    "ERROR: GROQ_API_KEY is required when LLM_PROVIDER=groq"
+  );
+  process.exit(1);
+}
+
 console.log(
-  `Config loaded: ${ALLOWED_USERS.length} allowed users, working dir: ${WORKING_DIR}`
+  `Config loaded: ${ALLOWED_USERS.length} allowed users, working dir: ${WORKING_DIR}, provider: ${LLM_PROVIDER}, model: ${LLM_MODEL}`
 );
